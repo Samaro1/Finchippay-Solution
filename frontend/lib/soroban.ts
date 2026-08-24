@@ -17,6 +17,7 @@ import {
   nativeToScVal,
   scValToNative,
   rpc,
+  xdr,
 } from "@stellar/stellar-sdk";
 import {
   CONTRACT_ID,
@@ -73,26 +74,83 @@ export interface SendTipResult {
   transactionHash: string;
 }
 
+export interface SorobanResourceEstimate {
+  cpuInstructions: number;
+  readBytes: number;
+  writeBytes: number;
+  resourceFeeStroops: number;
+}
+
+/** Simulate an already-built Soroban transaction using the shared RPC client. */
+export async function simulateTransactionResources(
+  transaction: Transaction,
+): Promise<SorobanResourceEstimate> {
+  const simulation = await getSorobanServer().simulateTransaction(transaction);
+  if (rpc.Api.isSimulationError(simulation)) {
+    throw new Error(`Simulation failed: ${simulation.error}`);
+  }
+
+  const response = simulation as unknown as Record<string, unknown>;
+  const cost = (response.cost ?? {}) as Record<string, unknown>;
+  let cpuInstructions = Number(cost.cpuInsns ?? cost.cpuInstructions ?? 0);
+  let readBytes = Number(cost.readBytes ?? 0);
+  let writeBytes = Number(cost.writeBytes ?? 0);
+
+  // read/write limits live in transactionData in current RPC responses. Decode
+  // the XDR so this also works with SDK versions that do not expose them on cost.
+  const transactionData = response.transactionData;
+  if (typeof transactionData === "string") {
+    try {
+      const resources = xdr.SorobanTransactionData.fromXDR(transactionData, "base64").resources();
+      cpuInstructions ||= Number(resources.instructions().toString());
+      readBytes ||= Number(resources.diskReadBytes());
+      writeBytes ||= Number(resources.writeBytes());
+    } catch {
+      // Older/custom RPCs may return a non-XDR transactionData shape.
+    }
+  }
+
+  return {
+    cpuInstructions,
+    readBytes,
+    writeBytes,
+    resourceFeeStroops: Number(response.minResourceFee ?? 0),
+  };
+}
+
 // ─── Contract Error Codes ─────────────────────────────────────────────────
 
+/** Maps `ContractError` discriminant values from the Soroban contract catalogue. */
 const ERROR_MESSAGES: Record<number, string> = {
   1: "Contract already initialized",
   2: "Unauthorized — you don't have permission for this action",
   3: "Amount must be positive",
-  4: "Insufficient balance — the sender account does not have enough funds",
-  5: "Escrow not found — no escrow exists with that ID",
-  6: "Escrow already released — funds have already been claimed",
-  7: "Escrow already cancelled — the escrow was previously cancelled",
-  8: "Not escrow recipient — only the designated recipient can claim this escrow",
-  9: "Not escrow sender — only the sender can cancel this escrow",
-  10: "Release ledger not reached — the release ledger has not been reached yet",
-  11: "Stream not found — no payment stream exists with that ID",
-  12: "Stream already ended — the stream has already been closed",
-  13: "Stream already cancelled — the stream was previously cancelled",
-  14: "Not stream participant — you are not a participant in this stream",
-  15: "Multi-sig proposal not found — no proposal exists with that ID",
-  16: "Already approved — you have already approved this proposal",
-  17: "Threshold already met — the signature threshold has already been reached",
+  4: "Release ledger must be in the future",
+  5: "Not found — the referenced escrow, stream, or proposal does not exist",
+  6: "Invalid state — this operation is not allowed in the current state",
+  7: "Arithmetic overflow detected",
+  8: "Invalid threshold — signer list length does not match the required threshold",
+  9: "Length mismatch — recipient or signer arrays have mismatched lengths",
+  10: "Already signed — you have already approved this proposal",
+  11: "Insufficient funds — the stream has insufficient deposited funds",
+  12: "Contract paused — value-transferring operations are temporarily blocked",
+  13: "Self-transfer is not allowed",
+  14: "Batch too large — the number of recipients exceeds the maximum allowed",
+  15: "Duplicate signer detected in the signers list",
+  16: "Proposal expired — this proposal can no longer be approved",
+  17: "Transfer failed — token balance did not increase by the expected amount",
+  18: "Index full — the recipient already has the maximum number of escrows",
+  19: "Emergency withdrawal is not ready yet",
+  20: "Not an authorized admin signer for this withdrawal",
+  21: "Invalid swap path — path is malformed or does not match the tokens",
+  22: "Slippage exceeded — the swap would return less than the minimum amount out",
+  23: "Excessive amount in — input required exceeds the maximum amount in",
+  24: "Invalid fee — new fee exceeds the maximum allowed swap fee",
+  25: "Admin action proposal not found",
+  26: "Admin action proposal has already been executed",
+  27: "Release ledger not reached — the yield escrow is not yet releasable",
+  28: "Reentrant call blocked — a mutating operation was re-entered mid-flight",
+  29: "Stale swap path — path references empty reserves or a repeated token",
 };
 
 function getErrorMessage(code: number): string {
@@ -150,11 +208,7 @@ async function withRetry<T>(
       // Don't retry contract panics / business logic errors — only network/timeout
       if (err instanceof Error) {
         const msg = err.message;
-        if (
-          msg.includes("ContractError") ||
-          msg.includes("Contract") ||
-          msg.includes("Error(")
-        ) {
+        if (msg.includes("ContractError") || msg.includes("Contract") || msg.includes("Error(")) {
           throw new Error(parseContractError(err));
         }
       }
@@ -208,15 +262,14 @@ export class FinchippayClient {
    * Simulate a contract invocation and return the result.
    * Internal helper used by all query methods.
    */
-  private async simulateCall(
-    method: string,
-    args: unknown[],
-    source?: string,
-  ): Promise<unknown> {
+  private async simulateCall(method: string, args: unknown[], source?: string): Promise<unknown> {
     return withRetry(async () => {
       const server = this.getServer();
       const contract = this.getContract();
-      const account = new Account(source || "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "0");
+      const account = new Account(
+        source || "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "0",
+      );
 
       const tx = new TransactionBuilder(account, {
         fee: this.baseFee,
@@ -256,9 +309,7 @@ export class FinchippayClient {
       const { getNetworkConfig } = require("./stellar") as typeof import("./stellar");
       const config = getNetworkConfig();
       // Load source account from Horizon for sequence number
-      const response = await fetch(
-        `${config.horizonUrl}/accounts/${sourcePublicKey}`,
-      );
+      const response = await fetch(`${config.horizonUrl}/accounts/${sourcePublicKey}`);
       if (!response.ok) {
         throw new Error(`Failed to load account ${sourcePublicKey}`);
       }
@@ -269,9 +320,7 @@ export class FinchippayClient {
         fee: this.baseFee,
         networkPassphrase: this.networkPassphrase,
       })
-        .addOperation(
-          contract.call(method, ...args.map((a) => this.toScVal(a))),
-        )
+        .addOperation(contract.call(method, ...args.map((a) => this.toScVal(a))))
         .setTimeout(60)
         .build();
 
@@ -371,12 +420,7 @@ export class FinchippayClient {
 
   // ── Query methods (read-only contract calls) ────────────────────────────
 
-  async sendTip(
-    token: string,
-    from: string,
-    to: string,
-    amount: string,
-  ): Promise<SendTipResult> {
+  async sendTip(token: string, from: string, to: string, amount: string): Promise<SendTipResult> {
     const tx = await this.buildSendTipTx(token, from, to, amount);
     return { transactionHash: tx.hash().toString("hex") };
   }
@@ -397,7 +441,7 @@ export class FinchippayClient {
       token: String(decoded.token ?? ""),
       amount: String(decoded.amount ?? "0"),
       releaseLedger: Number(decoded.releaseLedger ?? 0),
-      status: (String(decoded.status ?? "Pending")) as EscrowRecord["status"],
+      status: String(decoded.status ?? "Pending") as EscrowRecord["status"],
     };
   }
 
@@ -415,7 +459,7 @@ export class FinchippayClient {
       ratePerLedger: String(decoded.ratePerLedger ?? "0"),
       startLedger: Number(decoded.startLedger ?? 0),
       lastClaimLedger: Number(decoded.lastClaimLedger ?? 0),
-      status: (String(decoded.status ?? "Active")) as StreamRecord["status"],
+      status: String(decoded.status ?? "Active") as StreamRecord["status"],
     };
   }
 
@@ -445,10 +489,7 @@ export class FinchippayClient {
     return Boolean(result);
   }
 
-  async getMultisig(
-    proposalId: number,
-    caller?: string,
-  ): Promise<MultiSigProposal | null> {
+  async getMultisig(proposalId: number, caller?: string): Promise<MultiSigProposal | null> {
     const result = await this.simulateCall("get_multisig", [proposalId], caller);
     if (!result) return null;
     const decoded = result as Record<string, unknown>;
@@ -478,8 +519,7 @@ let _client: FinchippayClient | null = null;
  */
 export function getClient(): FinchippayClient {
   if (!_client) {
-    const rpcUrl =
-      process.env.NEXT_PUBLIC_SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
+    const rpcUrl = process.env.NEXT_PUBLIC_SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
     const contractId = CONTRACT_ID;
     const passphrase = NETWORK_PASSPHRASE;
 
